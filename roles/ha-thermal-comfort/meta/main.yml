@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: ha-thermal-comfort
+  author: you
+  description: Install Thermal Comfort custom integration into Home Assistant Container
+  license: MIT
+  min_ansible_version: "2.13"
+dependencies: []

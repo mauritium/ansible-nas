@@ -464,3 +464,8 @@
     - role: znc
       tags:
         - znc
+
+    - role: ha-thermal-comfort
+      tags:
+        - ha-thermal-comfort
+        - ha-addons

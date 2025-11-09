@@ -1,0 +1,117 @@
+# ha-thermal-comfort Tasks
+---
+# 1) Derive the HA *root* dir from ansible-nas vars
+- name: Derive Home Assistant root/config candidates from ansible-nas vars
+  ansible.builtin.set_fact:
+    ha_candidate_from_vars: >-
+      {{
+        homeassistant_config_directory
+          | default(homeassistant_data_directory, true)
+          | default(homeassistant_data_dir, true)
+          | default((docker_home ~ '/homeassistant') if (docker_home is defined) else None, true)
+          | default((docker_apps_root ~ '/homeassistant') if (docker_apps_root is defined) else None, true)
+      }}
+
+# 2) Fail if nothing was derived
+- name: Fail if we couldn't resolve a HA path from ansible-nas variables
+  ansible.builtin.fail:
+    msg: >-
+      Couldn't determine a Home Assistant path from ansible-nas variables.
+      Tried: homeassistant_config_directory, homeassistant_data_directory,
+      homeassistant_data_dir, docker_home/homeassistant, docker_apps_root/homeassistant.
+  when: ha_candidate_from_vars is not defined or ha_candidate_from_vars | length == 0
+
+# 3) Check candidate + candidate/config and pick the real config dir
+- name: Stat both possible locations
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ ha_candidate_from_vars }}"
+    - "{{ ha_candidate_from_vars }}/config"
+  register: ha_path_stats
+
+- name: Decide final ha_config_dir
+  vars:
+    root_path: "{{ ha_candidate_from_vars }}"
+    config_path: "{{ ha_candidate_from_vars }}/config"
+    root_has_config_yaml: "{{ (lookup('ansible.builtin.fileglob', root_path ~ '/configuration.yaml', errors='ignore') | list) | length > 0 }}"
+    config_has_config_yaml: "{{ (lookup('ansible.builtin.fileglob', config_path ~ '/configuration.yaml', errors='ignore') | list) | length > 0 }}"
+  ansible.builtin.set_fact:
+    ha_config_dir: >-
+      {{
+        ( root_has_config_yaml | ternary(root_path, None) )
+        | default( (config_has_config_yaml | ternary(config_path, None)), true )
+        | default( (ha_path_stats.results[1].stat.exists | ternary(config_path, None)), true )
+        | default( root_path, true )
+      }}
+
+- name: Ensure derived ha_config_dir exists
+  ansible.builtin.stat:
+    path: "{{ ha_config_dir }}"
+  register: ha_cfg_stat
+
+- name: Fail if derived ha_config_dir does not exist
+  ansible.builtin.fail:
+    msg: "Derived Home Assistant config directory {{ ha_config_dir }} does not exist."
+  when: not ha_cfg_stat.stat.exists
+
+- name: Debug chosen path (one-time sanity)
+  ansible.builtin.debug:
+    msg: "Using Home Assistant config directory: {{ ha_config_dir }}"
+
+- name: Ensure custom_components directory exists
+  ansible.builtin.file:
+    path: "{{ ha_config_dir }}/custom_components"
+    state: directory
+    mode: "0755"
+
+- name: Prepare temp directory
+  ansible.builtin.file:
+    path: "{{ thermal_comfort_tmp_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Fetch thermal_comfort repo at requested version
+  ansible.builtin.git:
+    repo: "https://github.com/dolezsa/thermal_comfort.git"
+    dest: "{{ thermal_comfort_tmp_dir }}/repo"
+    version: "{{ thermal_comfort_version }}"
+    depth: 1
+    force: true
+
+- name: Remove existing thermal_comfort directory (optional clean slate)
+  ansible.builtin.file:
+    path: "{{ ha_config_dir }}/custom_components/thermal_comfort"
+    state: absent
+
+- name: Copy component into HA config
+  ansible.builtin.copy:
+    src: "{{ thermal_comfort_tmp_dir }}/repo/custom_components/thermal_comfort"
+    dest: "{{ ha_config_dir }}/custom_components/"
+    remote_src: true          # <-- key fix: src lives on the remote
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart homeassistant
+
+
+- name: Record installed version
+  ansible.builtin.copy:
+    dest: "{{ ha_config_dir }}/custom_components/thermal_comfort/.installed_version"
+    content: "{{ thermal_comfort_version }}\n"
+    mode: "0644"
+  notify: restart homeassistant
+
+- name: Cleanup temp directory
+  ansible.builtin.file:
+    path: "{{ thermal_comfort_tmp_dir }}"
+    state: absent
+
+- name: Apply any pending handlers now
+  ansible.builtin.meta: flush_handlers
+
+- name: Show hint to add the integration in UI
+  ansible.builtin.debug:
+    msg: >-
+      Thermal Comfort {{ thermal_comfort_version }} installed. In Home Assistant,
+      go to Settings → Devices & Services → Add Integration → "Thermal Comfort".

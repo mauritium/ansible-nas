@@ -1,0 +1,6 @@
+# No duplicated path here on purpose.
+ha_container_name: "homeassistant"
+
+thermal_comfort_version: "2.2.5"
+thermal_comfort_tmp_dir: "/tmp/thermal_comfort_role"
+thermal_comfort_restart_ha: true

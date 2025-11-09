@@ -1,0 +1,6 @@
+---
+- name: restart homeassistant
+  when: thermal_comfort_restart_ha | bool
+  ansible.builtin.command:
+    cmd: "docker restart {{ ha_container_name }}"
+  changed_when: true
