@@ -1,0 +1,258 @@
+---
+- name: "Kimai | Start (enabled=true)"
+  when: kimai_enabled | bool
+  block:
+    - name: Create Kimai network
+      community.docker.docker_network:
+        name: "{{ kimai_internal_network }}"
+        
+    - name: "Kimai | Ensure data directories exist"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ kimai_data_dir }}"
+        - "{{ kimai_db_dir }}"
+    
+    - name: "Kimai | Ensure DB conf dir"
+      ansible.builtin.file:
+        path: "{{ kimai_db_conf_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Kimai | Write MariaDB config (relaxed sql_mode)"
+      ansible.builtin.copy:
+        dest: "{{ kimai_db_conf_dir }}/zz-kimai.cnf"
+        mode: "0644"
+        content: |
+          [mysqld]
+          # Keep strict-ish, but allow legacy zeros Kimai migrations expect
+          sql_mode=STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+          character-set-server=utf8mb4
+          collation-server=utf8mb4_unicode_ci
+          default_time_zone=+00:00
+    
+    - name: "Kimai | Run MariaDB container"
+      community.docker.docker_container:
+        name: kimai-db
+        image: "{{ kimai_db_image }}"
+        restart_policy: unless-stopped
+        networks:
+          - name: "{{ kimai_internal_network }}"
+        volumes:
+          - "{{ kimai_db_dir }}:/var/lib/mysql"
+          - "{{ kimai_db_conf_dir }}/zz-kimai.cnf:/etc/mysql/conf.d/zz-kimai.cnf:ro"
+        env:
+          MYSQL_DATABASE: "{{ kimai_db_name }}"
+          MYSQL_USER: "{{ kimai_db_user }}"
+          MYSQL_PASSWORD: "{{ kimai_db_password }}"
+          MYSQL_ROOT_PASSWORD: "{{ kimai_db_root_password }}"
+        healthcheck:
+          test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+          interval: 10s
+          timeout: 3s
+          retries: 30
+
+    - name: "Kimai | Wait for DB to become ready"
+      community.docker.docker_container_exec:
+        container: kimai-db
+        command: "mysqladmin ping -h localhost -u{{ kimai_db_user }} -p{{ kimai_db_password }}"
+      register: _db_ping
+      retries: 5
+      delay: 5
+      until: _db_ping.rc == 0
+      changed_when: false
+
+    - name: "Kimai | Base Traefik labels"
+      ansible.builtin.set_fact:
+        kimai__labels_base:
+          traefik.enable: "True"
+          traefik.http.routers.kimai.rule: "Host(`{{ kimai_fqdn }}`)"
+          traefik.http.routers.kimai.tls.certresolver: "letsencrypt"
+          traefik.http.routers.kimai.tls.domains[0].main: "{{ ansible_nas_domain }}"
+          traefik.http.routers.kimai.tls.domains[0].sans: "*.{{ ansible_nas_domain }}"
+          traefik.http.services.kimai.loadbalancer.server.port: "{{ kimai_port }}"
+
+    # Optional Homepage widget labels
+    - name: "Kimai | Homepage labels (conditional)"
+      ansible.builtin.set_fact:
+        kimai__labels_homepage: >-
+          {{
+            {
+              'homepage.group': 'Productivity',
+              'homepage.name': 'Kimai',
+              'homepage.icon': 'kimai',
+              'homepage.href': 'https://' ~ kimai_fqdn
+            } if (kimai_available_externally | bool) else {}
+          }}
+
+    - name: "Kimai | Combine labels"
+      ansible.builtin.set_fact:
+        kimai__labels: >-
+          {{
+            kimai__labels_base
+            | combine(kimai__labels_homepage)
+            | combine(kimai_labels_extra | default({}), recursive=True)
+          }}
+
+    - name: "Kimai | Run app container"
+      community.docker.docker_container:
+        name: kimai
+        image: "{{ kimai_image }}"
+        restart_policy: unless-stopped
+        networks:
+          - name: "{{ kimai_internal_network }}"
+        published_ports: []
+        volumes:
+          - "{{ kimai_data_dir }}:/opt/kimai/var"
+        env: "{{ {
+          'DATABASE_URL': 'mysql://' ~ kimai_db_user ~ ':' ~ kimai_db_password ~ '@kimai-db:3306/' ~ kimai_db_name ~ '?charset=utf8mb4',
+          'APP_ENV': 'prod',
+          'APP_SECRET': kimai_app_secret,
+          'TRUSTED_PROXIES': '127.0.0.1,REMOTE_ADDR',
+          'TRUSTED_HOSTS': kimai_fqdn
+        } | combine(kimai_extra_env | default({}), recursive=True) }}"
+        labels: "{{ kimai__labels }}"
+        healthcheck:
+          test:
+            - CMD-SHELL
+            - >
+              php -r '$h=@get_headers("http://127.0.0.1:{{ kimai_port }}/");
+              exit((is_array($h) && preg_match("#^HTTP/1\.[01] [23]#", $h[0]))?0:1);'
+          interval: 15s
+          timeout: 5s
+          retries: 10
+          start_period: 60s
+    
+    - name: "Kimai | Wait for HTTP to respond"
+      community.docker.docker_container_exec:
+        container: kimai
+        command: "php -r 'echo get_headers(\"http://localhost:{{ kimai_port }}/\")[0] ?? \"\";'"
+      register: _kimai_http
+      retries: 5
+      delay: 15
+      until: _kimai_http.stdout is search('^HTTP/1\\.[01] [23]')
+      changed_when: false
+    
+    - name: "Kimai | Wait for Symfony console to be available (app kernel boot)"
+      community.docker.docker_container_exec:
+        container: kimai
+        command: "/opt/kimai/bin/console about -vvv"
+      register: _kimai_about
+      retries: 6
+      delay: 5
+      until: _kimai_about.rc == 0
+      changed_when: false
+
+    # 1) Detect if the DB is already initialized (look for a well-known Kimai table)
+    - name: "Kimai | Check if DB already initialized"
+      community.docker.docker_container_exec:
+        container: kimai-db
+        command: >
+          sh -lc "mysql -u{{ kimai_db_user }} -p'{{ kimai_db_password }}' -D {{ kimai_db_name }} -Nse
+          \"SHOW TABLES LIKE 'kimai2_roles';\""
+      register: kimai_db_has_roles_table
+      failed_when: false
+      changed_when: false
+
+    # 2) Fresh install only when the DB is empty (no kimai2_roles table)
+    - name: "Kimai | Fresh install (first run only)"
+      community.docker.docker_container_exec:
+        container: kimai
+        command: "/opt/kimai/bin/console kimai:install -n -vvv"
+      when: (kimai_db_has_roles_table.stdout | trim) == ""
+
+    # 3) Always apply pending migrations safely (no-op if none)
+    - name: "Kimai | Run pending migrations"
+      community.docker.docker_container_exec:
+        container: kimai
+        command: "/opt/kimai/bin/console doctrine:migrations:migrate -n --allow-no-migration"
+      register: kimai_migrate
+      failed_when: kimai_migrate.rc != 0
+      changed_when: "'No migrations to execute' not in (kimai_migrate.stdout | default(''))"
+    
+    - name: "Kimai | Ensure admin user exists (idempotent)"
+      community.docker.docker_container_exec:
+        container: kimai
+        command: >-
+          /opt/kimai/bin/console kimai:user:create
+          admin {{ kimai_admin_email | quote }} ROLE_SUPER_ADMIN {{ kimai_admin_password | quote }}  -n
+      register: kimai_admin_create
+      # Don't fail if it's already there
+      failed_when: >
+        kimai_admin_create.rc != 0 and
+        ('already in use' not in (kimai_admin_create.stdout | lower) ) and
+        ('already used' not in (kimai_admin_create.stdout | lower) ) and
+        ('already in use' not in (kimai_admin_create.stderr | lower) ) and
+        ('already used' not in (kimai_admin_create.stderr | lower) )
+      # Mark changed only when a user actually got created
+      changed_when: >
+        ('already in use' not in (kimai_admin_create.stdout | lower) ) and
+        ('already used' not in (kimai_admin_create.stdout | lower) ) and
+        ('already in use' not in (kimai_admin_create.stderr | lower) ) and
+        ('already used' not in (kimai_admin_create.stderr | lower) )
+    
+    # Optional: HTTP should redirect to HTTPS (301)
+    - name: "Kimai | Traefik HTTP -> HTTPS redirect works"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1/"
+        method: GET
+        headers:
+          Host: "{{ kimai_fqdn }}"
+        follow_redirects: none
+        return_content: false
+        status_code: 301
+      register: kimai_http_redirect
+      retries: 4
+      delay: 3
+      until: kimai_http_redirect.status == 301
+      changed_when: false
+    
+    - name: "Kimai | Traefik HTTPS quick check (fail fast on 404)"
+      ansible.builtin.uri:
+        url: "https://127.0.0.1/"
+        method: GET
+        headers:
+          Host: "{{ kimai_fqdn }}"
+        follow_redirects: none
+        validate_certs: false
+        return_content: false
+        status_code: 200,301,302,401,403,500,502,503  # accept a range; we'll decide below
+      register: kimai_https_probe
+      changed_when: false
+      failed_when: kimai_https_probe.status == 404
+      
+    # HTTPS should return 200 via Traefik (follow redirects, ignore self-signed)
+    - name: "Kimai | Traefik HTTPS returns 200"
+      ansible.builtin.uri:
+        url: "https://127.0.0.1/"
+        method: GET
+        headers:
+          Host: "{{ kimai_fqdn }}"
+        follow_redirects: all
+        validate_certs: false
+        return_content: false
+        status_code: 200
+      register: kimai_https_ok
+      retries: 20
+      delay: 3
+      until: kimai_https_ok.status == 200
+      changed_when: false
+    
+    - name: "Kimai | Output access URL"
+      ansible.builtin.debug:
+        msg: "Kimai available at https://{{ kimai_fqdn }}"
+
+- name: "Kimai | Stop (enabled=false)"
+  when: not (kimai_enabled | bool)
+  block:
+    - name: "Kimai | Stop app container"
+      community.docker.docker_container:
+        name: kimai
+        state: absent
+
+    - name: "Kimai | Stop DB container"
+      community.docker.docker_container:
+        name: kimai-db
+        state: absent

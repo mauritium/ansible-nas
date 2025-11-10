@@ -213,6 +213,10 @@
       tags:
         - joomla
 
+    - role: kimai
+      tags:
+        - kimai
+        
     - role: komga
       tags:
         - komga

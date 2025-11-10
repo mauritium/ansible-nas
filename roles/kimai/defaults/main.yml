@@ -1,0 +1,39 @@
+---
+
+# Networking
+kimai_internal_network: "kimai"      # shared user-defined bridge for app<->DB and Traefik
+traefik_container_name: "traefik"    # adjust if your container name differs
+
+# Domain / routing
+kimai_hostname: "kimai"
+kimai_domain: "{{ ansible_nas_domain | default('example.com') }}"
+kimai_fqdn: "{{ kimai_hostname }}.{{ kimai_domain }}"
+kimai_available_externally: true
+
+# Role-local root for volumes; falls back to global docker_home or /srv/docker
+kimai_root_dir: "{{ docker_home | default('/srv/docker') }}"
+
+# Paths
+kimai_data_dir: "{{ kimai_root_dir }}/kimai"
+kimai_db_dir: "{{ kimai_root_dir }}/kimai-db"
+
+# Images
+kimai_image: "kimai/kimai2:apache"   # was ghcr.io/kimai/kimai2:latest
+kimai_db_image: "mariadb:10.11"
+
+# Database
+kimai_db_name: "kimai"
+kimai_db_user: "kimai"
+kimai_db_password: "CHANGE_ME_DB"  # override in inventory/host_vars
+kimai_db_root_password: "{{ kimai_db_password }}"
+kimai_db_conf_dir: "{{ kimai_root_dir }}/kimai-db/conf"
+
+# App
+kimai_app_secret: "CHANGE_ME_LONG_RANDOM"  # override in inventory/host_vars
+kimai_extra_env: {}  # map of extra environment variables for the app container
+kimai_labels_extra: {}  # map of extra labels to attach to the app container
+kimai_port: 8001
+
+# Admin bootstrap (idempotent post-deploy)
+kimai_admin_email: "you@example.com"
+kimai_admin_password: "CHANGE_ME_ADMIN"  # used only if admin is missing
